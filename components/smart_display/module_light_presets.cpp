@@ -10,6 +10,42 @@
 
 namespace runtime_tiles {
 
+// The ring round the key of the preset the light shows, or, while a tapped preset is on its way (preset_pending), a
+// spinner turning where its ring will be: the ring's size, width and ink, so the one becomes the other. The spinner is
+// the key's sibling, kept in the key's user data: LVGL draws a child only inside its parent's box, which cut the arc to
+// the key's square; the key's parent keeps the ring's room round it.
+static void preset_spinner_drop(lv_obj_t *k) {
+  if (!k) return;
+  if (auto *spin = (lv_obj_t *) lv_obj_get_user_data(k)) lv_obj_delete(spin);
+  lv_obj_set_user_data(k, nullptr);
+}
+static void preset_mark(lv_obj_t *k, bool lit, bool busy) {
+  if (!k) return;
+  auto *spin = (lv_obj_t *) lv_obj_get_user_data(k);
+  if (!busy) preset_spinner_drop(k), spin = nullptr;
+  const int width = std::max(2, ui::px(2)), size = lv_obj_get_style_width(k, LV_PART_MAIN);
+  const int outer = size + 2 * (light_presets::ring_pad() + width);
+  if (busy && !spin && (spin = spinner_create(lv_obj_get_parent(k), outer, width))) {
+    lv_obj_set_style_arc_opa(spin, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(spin, theme::color(theme::INK), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(spin, light_presets::RING_OPA, LV_PART_INDICATOR);
+    lv_obj_add_flag(spin, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_user_data(k, spin);
+  }
+  // Where the key stands now (the panel places its keys before it marks them).
+  if (spin) lv_obj_set_pos(spin, lv_obj_get_style_x(k, LV_PART_MAIN) - (outer - size) / 2, lv_obj_get_style_y(k, LV_PART_MAIN) - (outer - size) / 2);
+  // Without a spinner (a board that builds none) the ring shows at once, as before.
+  light_presets::mark(k, busy ? !spin : lit);
+}
+
+// A tap on a preset's key: the light to that preset, as a wish, unless a preset is still on its way (its spinner turns).
+// A preset is several wishes at once (its colour and brightness, an effect, the device's settings), and taps that fold
+// field by field would leave the light with parts of two presets: the next one waits until Home Assistant has this one.
+static void preset_tap(Tile &t, unsigned n) {
+  if (preset_pending(t) >= 0) return;
+  preset_wish(t, t.presets->items[n]);
+}
+
 // ---- A tile's panel ----
 // A tap on a preset's key (user data: the slot times 8 plus the key): the light to that preset, as a wish.
 static void preset_key_event(lv_event_t *e){
@@ -17,13 +53,13 @@ static void preset_key_event(lv_event_t *e){
   if(slot>=widgets.size()||n>=light_presets::MAX||widgets[slot].index>=model.count)return;
   auto &t=model.tiles[widgets[slot].index];
   if(!t.presets||n>=t.presets->count||!allowed_wish(esphome::millis(),(int)widgets[slot].index,"preset"))return;
-  preset_wish(t,t.presets->items[n]);
+  preset_tap(t,n);
 }
 // The panel's keys of the presets that fit (`r`), made again only when the presets, their number or their size change.
 static void preset_keys(Widgets &w,const light_presets::Presets *ps,const light_presets::Row &r){
   const int shape=r.size*8+r.count;
   if(ps==w.dots_of&&shape==w.dots_size)return;
-  for(auto *&d:w.dots)if(d){lv_obj_delete(d);d=nullptr;}
+  for(auto *&d:w.dots)if(d){preset_spinner_drop(d);lv_obj_delete(d);d=nullptr;}
   w.dots_of=ps;w.dots_size=shape;
   if(!ps)return;
   for(int n=0;n<r.count;++n){
@@ -51,10 +87,10 @@ int preset_panel(Widgets &w, const Tile &t, const PanelMetrics &m, bool taller, 
   panel_w=std::max(row_w,slider_w);
   const int row_y=(pair_light?m.slider_h+(r.count?m.gap:0):0)+ring;
   panel_h=row_y+r.size+ring;
-  const int lit=preset_lit(t);
+  const int lit=preset_lit(t),busy=preset_pending(t);
   for(int n=0;n<r.count;++n){
     lv_obj_set_pos(w.dots[n],(panel_w-row_w)/2+ring+n*(r.size+r.gap),row_y);
-    light_presets::mark(w.dots[n],n==lit);
+    preset_mark(w.dots[n],busy<0&&n==lit,n==busy);
   }
   if(pair_light&&w.control_slider){
     lv_obj_remove_flag(w.control_slider,LV_OBJ_FLAG_HIDDEN);lv_obj_set_pos(w.control_slider,(panel_w-slider_w)/2,0);
@@ -74,12 +110,12 @@ static void colour_preset_event(lv_event_t *e) {
   if (i < 0 || light_controls::demo) return;
   auto &t = model.tiles[i];
   if (!t.presets || n >= t.presets->count || !allowed_wish(esphome::millis(), i, "preset")) return;
-  preset_wish(t, t.presets->items[n]);
+  preset_tap(t, n);
 }
-// The ring round the key of the preset the light shows.
+// The ring round the key of the preset the light shows, the spinner round one on its way.
 void colour_presets_paint(const Tile &t) {
-  const int lit = colour_presets ? preset_lit(t) : -1;
-  for (unsigned n = 0; n < colour_dots.size(); ++n) light_presets::mark(colour_dots[n], (int) n == lit);
+  const int lit = colour_presets ? preset_lit(t) : -1, busy = colour_presets ? preset_pending(t) : -1;
+  for (unsigned n = 0; n < colour_dots.size(); ++n) preset_mark(colour_dots[n], busy < 0 && (int) n == lit, (int) n == busy);
 }
 // Whether the presets stand beside the rows, and the column's width.
 int colour_column() { return light_presets::card_key() + 2 * light_controls::row_inset; }
@@ -159,10 +195,11 @@ static void detail_preset_event(lv_event_t *e){
   if(detail_index>=model.count)return;
   auto &t=model.tiles[detail_index];
   if(!t.presets||n>=t.presets->count||!allowed_wish(esphome::millis(),(int)detail_index,"preset"))return;
-  preset_wish(t,t.presets->items[n]);
+  preset_tap(t,n);
 }
 static void detail_preset_paint(lv_obj_t *key,const Tile &t,const CardPart &part){
-  light_presets::mark(key,t.presets&&preset_lit(t)==(int)part.arg);
+  const int busy=t.presets?preset_pending(t):-1;
+  preset_mark(key,busy<0&&t.presets&&preset_lit(t)==(int)part.arg,busy==(int)part.arg);
 }
 // Its presets in `x`, `y`, `width` x `height`: centred, or from the left edge where the card stands in two columns.
 void light_card_presets(const Tile &t, int x, int y, int width, int height, bool left) {

@@ -13,12 +13,28 @@ export type DoorbellSuggestion = { trigger: string; kind: TriggerKind; camera: s
 export type DoorbellReference = {
   show?: string; dismiss?: string; event?: string; feature?: string; answered?: string; missed?: string;
   timeout?: { default: number; min: number; max: number };
+  /** How long a missed ring stays in the top bars, in minutes (0: until someone opens it): the wizard's choices and what a
+   * new automation gets. */
+  keep?: { choices: number[]; new: number; max: number };
   fields?: DoorbellField[]; endings?: { action: string; label: string }[];
   trigger_domains?: Record<string, TriggerKind>; suggestions?: DoorbellSuggestion[];
 };
 /** What a ring does on a screen (server.doorbell_kind): the camera live, its alert with its picture, or the alert alone. */
 export type DoorbellKind = "view" | "picture" | "plain";
-export type DoorbellChoice = { trigger?: string; camera?: string; title?: string; screens?: string[]; timeout?: number; name?: string };
+/** The ring's door key (docs/DOORBELL.md, "Open the door"): a lock, or another action of an entity's own (a script, a
+ * gate's button) that the app performs on the second tap. */
+export type DoorChoice = { kind: "none" | "lock" | "action"; lock?: string; entity?: string; action?: string };
+/** `sound`: whether the view opens with its sound on (the default) or quiet, for a screen somewhere quiet; `chime`: whether
+ * the screen chimes when it rings (the default) or rings without; `keep`: the minutes a missed ring stays in the top bars,
+ * 0 until someone opens it. */
+export type DoorbellChoice = { trigger?: string; camera?: string; title?: string; screens?: string[]; timeout?: number; name?: string; door?: DoorChoice; sound?: boolean; chime?: boolean; keep?: number };
+
+/** The event's fields of a door: `lock`, or `door_action` with the entity in `door_data`; none without one. */
+export function doorFields(door: DoorChoice | undefined): Record<string, unknown> {
+  if (door?.kind === "lock" && door.lock) return { lock: door.lock };
+  if (door?.kind === "action" && door.entity && door.action) return { door_action: door.action, door_data: { entity_id: door.entity } };
+  return {};
+}
 
 const SHOW = "esp_screens_doorbell", DISMISS = "esp_screens_dismiss_doorbell", MISSED = "esp_screens_doorbell_missed";
 
@@ -41,6 +57,10 @@ export function doorbellAutomation(reference: DoorbellReference | undefined, cho
       ...(choice.title ? { title: choice.title } : {}),
       ...(screens.length ? { screen: screens.length === 1 ? screens[0] : screens } : {}),
       ...(choice.timeout && choice.timeout !== fallback ? { timeout: choice.timeout } : {}),
+      ...(choice.sound === false ? { sound: false } : {}),
+      ...(choice.chime === false ? { chime: false } : {}),
+      ...(choice.keep ? { keep_minutes: choice.keep } : {}),
+      ...doorFields(choice.door),
     } }],
   };
 }

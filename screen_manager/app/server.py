@@ -1105,7 +1105,8 @@ class Manager:
         self.alert_cameras = {}
         # A camera live on a P4 (live_stream.py): its links and the sources behind them, on the camera port.
         self.live = live_stream.LiveFeed(lambda entity: self.ha.camera_image(entity), lambda: self.ha.websocket(),
-                                       lambda entity: self.ha.camera_streams(entity), live_tiles=self.live_tiles_of)
+                                       lambda entity: self.ha.camera_streams(entity), live_tiles=self.live_tiles_of,
+                                       screen_name=self.name_of)
         self.links = picture_links.Links()
         self.sources = picture_sources.Sources(picture_sources.Providers.of(self), self.snapshots)
         self.pictures = picture_service.Service(self, self.sources, self.links, self.live)
@@ -1284,6 +1285,11 @@ class Manager:
             view = has_module(screen, 'doorbell') and self.live_camera(screen)
         return 'view' if view else 'picture' if board_of(screen) in picture_question.BOXES else 'plain'
 
+    def name_of(self, inbox):
+        """The name this app gives the screen of `inbox` (its own label, else Home Assistant's), or the inbox."""
+        screen = self.screen(inbox)
+        return (self.labels.get(screen.get('device_id')) or screen['name']) if screen else inbox
+
     def live_tiles_of(self, inbox):
         """How many live camera tiles the screen of `inbox` streams at once, from its hello (page_delivery.caps_of,
         firmware hw.h), or None while it is not connected or its firmware did not say."""
@@ -1291,6 +1297,34 @@ class Manager:
         if sender is None or getattr(sender, 'protocol', None) is None:
             return None
         return (getattr(sender, 'caps', None) or {}).get('live_tiles')
+
+    def picture_turn_of(self, inbox):
+        """How the screen of `inbox` takes its live pictures: turned as its glass is (90, 180 or 270, its hello's
+        picture_turn), or 0 upright."""
+        sender = self.page_senders.get(self.aliases.get(inbox, inbox))
+        return (getattr(sender, 'caps', None) or {}).get('picture_turn') or 0 if sender is not None else 0
+
+    def own_camera_of(self, inbox, screen, entity):
+        """Whether `entity` is the screen of `inbox`'s own camera as Home Assistant shows it (Video in Home Assistant: the
+        tessera_video camera on the screen's own device) and the screen draws a tile of it from the camera itself (its
+        hello's own_camera, plugin API 0.22)."""
+        sender = self.page_senders.get(self.aliases.get(inbox, inbox))
+        if sender is None or not (getattr(sender, 'caps', None) or {}).get('own_camera'):
+            return False
+        item = self.registry_index().get(entity) or {}
+        device = (screen or {}).get('device_id')
+        if not device or item.get('platform') != screen_video.DOMAIN:
+            return False
+        if item.get('device_id') == device:
+            return True
+        # The camera on a device of its own beside the screen's, with the screen's MAC: Home Assistant kept the two
+        # apart (seen on a reTerminal D1001, 2026-10-28), and it is the same screen.
+        devices = {d.get('id'): d for d in getattr(self.ha, 'devices', None) or [] if isinstance(d, dict)}
+
+        def macs(found):
+            return {str(c[1]).lower() for c in (found or {}).get('connections') or []
+                    if isinstance(c, (list, tuple)) and len(c) == 2 and c[0] == 'mac'}
+        return bool(macs(devices.get(device)) & macs(devices.get(item.get('device_id'))))
 
     def live_camera(self, screen):
         """Whether this screen streams a camera live (live_stream.py): its hello while it is connected (`live`), else its
@@ -1778,10 +1812,6 @@ class Manager:
         if screen is None:
             screen = self.screen(inbox) or {}
         return screen_firmware(screen)
-
-    def supports_twenty(self, inbox):
-        version=self.firmware_version(inbox)
-        return bool(version) and version >= (0,2,7)
 
     def supports_header(self, inbox, screen=None):
         return (self.firmware_version(inbox, screen) or (0, 0, 0)) >= HEADER_MIN_FIRMWARE
@@ -3705,7 +3735,7 @@ class Manager:
                 self.ha.changed.set()
 
     async def saver_picture(self, inbox, screen, kind):
-        """The picture of the step a plugin's screensaver face draws (plugin API 0.14, 'saver:picture'): the cover of the
+        """The picture of the step a plugin's screensaver face draws (its address `step:`): the cover of the
         player the music step shows, or the photo of the photos step; None while there is none."""
         if kind.get('step') == 'photos':
             return self.photos.raw(inbox)
@@ -4052,9 +4082,22 @@ class Manager:
         return out
 
     async def doorbell_send(self, screens, message):
-        results = await asyncio.gather(*(self.send_auxiliary(screen['id'], message, self.transport(screen['id'], screen), self.page_scope(screen['id']))
+        """`message` to each of `screens`, or `message(screen)` for a message of each one's own: how many took it."""
+        results = await asyncio.gather(*(self.send_auxiliary(screen['id'], message(screen) if callable(message) else message,
+                                                             self.transport(screen['id'], screen), self.page_scope(screen['id']))
                                          for screen in screens), return_exceptions=True)
         return sum(1 for result in results if result is True)
+
+    async def doorbell_link(self, screen, camera):
+        """The stream of `camera` for the ring's view on `screen`, made as the event comes: the screen opens it at once,
+        where asking for one took 1.3 s of a ring's 1.54 s to its first picture (docs/PLATFORM_PLAN.md 4.9). Its room
+        comes with the screen's first open (?room=WxH). None without an address for this app on its network."""
+        base = await self.link_base(screen)
+        if not base:
+            return None
+        sound = bool((self.caps_of_screen(screen) or {}).get('speaker'))
+        token = self.live.link(camera, None, sound=sound, screen=screen['id'], turn=self.picture_turn_of(screen['id']))
+        return f'{base}/camera/{token}.mjpeg'
 
     async def doorbell_show(self, data):
         """esp_screens_doorbell (docs/DOORBELL.md): the doorbell's camera on the screens the event names, every screen
@@ -4064,6 +4107,16 @@ class Manager:
         if camera is None:
             LOG.warning('%s: no camera (camera.<name>), nothing sent', doorbell.SHOW)
             return {'sent': 0, 'alerts': 0, 'skipped': 0, 'failed': 0, 'unusable': unusable}
+        door, door_unusable = doorbell.door_of(data)
+        sound, sound_unusable = doorbell.sound_of(data)
+        chime, chime_unusable = doorbell.sound_of(data, 'chime')
+        keep, keep_unusable = doorbell.keep_of(data)
+        unusable = unusable + door_unusable + sound_unusable + chime_unusable + keep_unusable
+        if door and door.get('lock'):
+            blocked = doorbell.door_blocked(door['lock'], self.ha.states, self.registry_index().get(door['lock']))
+            if blocked:
+                LOG.warning('%s: %s %s, so the view has no door key', doorbell.SHOW, door['lock'], blocked)
+                door = None
         paired = self.screens()
         wanted, usable = alert_screen_names(data)
         if not usable:
@@ -4077,8 +4130,17 @@ class Manager:
         name = title or doorbell.name_of(camera, self.device_name_of(camera), self.ha.states)
         # The screens may open this camera now (camera_allowed), as after an alert with its picture.
         self.alert_cameras[camera] = time.monotonic()
-        key = self.doorbells.start(camera, name, timeout, [screen['id'] for screen in views], [screen['node'] for screen in others])
-        sent = await self.doorbell_send(views, self.doorbells.message(key)) if views else 0
+        key = self.doorbells.start(camera, name, timeout, [screen['id'] for screen in views], [screen['node'] for screen in others],
+                                   door, [screen.get('node') for screen in views if screen.get('node')], sound, chime, keep)
+        links = dict(zip((screen['id'] for screen in views),
+                         await asyncio.gather(*(self.doorbell_link(screen, camera) for screen in views))))
+        if any(links.values()):
+            self.live.warm(camera)  # its first picture on its way before the first screen opens its link
+        state = self.doorbell_lock_state(door)
+        sent = await self.doorbell_send(views, lambda screen: self.doorbells.message(key, door_state=state,
+                                                                                  link=links.get(screen['id']))) if views else 0
+        if door and door.get('lock') and views:
+            asyncio.ensure_future(self.doorbell_follow_lock(key))
         alerts = {'sent': 0, 'skipped': 0, 'failed': 0}
         if others:
             alerts = await self.broadcast(BROADCAST_SHOW, {'title': name, 'icon': doorbell.ALERT_ICON, 'camera': camera,
@@ -4094,6 +4156,7 @@ class Manager:
     async def doorbell_close(self, key, views, alerts):
         """A ring ends: its view closes on `views` (inboxes), its alert on `alerts` (nodes)."""
         screens = [screen for screen in self.screens() if screen['id'] in set(views) and self.transport(screen['id'], screen)]
+        self.doorbells.gone(key, [screen.get('node') for screen in self.screens() if screen['id'] in set(views)])
         closed = await self.doorbell_send(screens, self.doorbells.message(key, close=True)) if screens else 0
         if alerts:
             await self.broadcast(BROADCAST_DISMISS, {'screen': list(alerts)})
@@ -4123,12 +4186,65 @@ class Manager:
         except Exception as error:
             LOG.warning('%s was not fired (%s)', event_type, type(error).__name__)
 
+    def doorbell_lock_state(self, door):
+        """The state of a ring's lock as Home Assistant has it, '' without one."""
+        lock = (door or {}).get('lock')
+        return str((self.ha.states.get(lock) or {}).get('state') or '') if lock else ''
+
+    def doorbell_view_screens(self, key):
+        """The screens whose view of ring `key` still shows."""
+        nodes = set(self.doorbells.showing(key))
+        return [screen for screen in self.doorbell_screens() if screen.get('node') in nodes]
+
+    async def doorbell_follow_lock(self, key):
+        """While ring `key` shows on a screen, every new state of its lock goes to those screens' door key."""
+        ring = self.doorbells.ring(key)
+        changes = getattr(self.ha, 'state_events', None)
+        if ring is None or ring.get('following') or changes is None:
+            return
+        lock, sent = ring['door']['lock'], self.doorbell_lock_state(ring['door'])
+        ring['following'] = True
+        wake = asyncio.Event()
+        changes.listeners[wake] = frozenset({lock})
+        try:
+            while self.doorbells.showing(key):
+                try:
+                    await asyncio.wait_for(wake.wait(), 5)
+                except asyncio.TimeoutError:
+                    continue
+                wake.clear()
+                state = self.doorbell_lock_state(ring['door'])
+                if state != sent:
+                    sent = state
+                    await self.doorbell_send(self.doorbell_view_screens(key), self.doorbells.door_message(key, state))
+        finally:
+            changes.listeners.pop(wake, None)
+            ring['following'] = False
+
+    async def doorbell_open_door(self, key, node):
+        """A second tap on the door key of ring `key` on screen `node`: the ring's lock unlocks, or its action runs, once."""
+        door = self.doorbells.door_press(key, node)
+        if door is None:
+            LOG.warning('Doorbell door from %s: no door of a ring that shows there, nothing performed', node)
+            return
+        action, fields = ('lock.unlock', {'entity_id': door['lock']}) if door.get('lock') else (door['action'], door['data'])
+        try:
+            await self.ha.call(action, fields)
+            LOG.info('Doorbell door on %s: %s performed', node, action)
+        except Exception as error:
+            LOG.warning('Doorbell door on %s: %s failed (%s)', node, action, type(error).__name__)
+
     async def doorbell_report(self, data):
         """A screen says how a ring ended there (esphome.screen_doorbell): answered or closed closes it on the others,
-        seen takes a missed ring out of the top bars."""
+        seen takes a missed ring out of the top bars, door opens the ring's door."""
         if not isinstance(data, dict):
             return
         action, key, node = data.get('action'), data.get('key'), data.get('screen')
+        if action == doorbell.DOOR and isinstance(key, str):
+            await self.doorbell_open_door(key, node)
+            return
+        if action in ('closed', 'missed') and isinstance(key, str):
+            self.doorbells.gone(key, [node])
         if action in doorbell.ANSWERS and isinstance(key, str):
             had_missed = self.doorbells.missed is not None
             first = not (self.doorbells.ring(key) or {'answered': True})['answered']
@@ -4142,8 +4258,16 @@ class Manager:
                 LOG.info('Doorbell ring %s on %s: closed on %d other screens', action, node, closed)
             if had_missed and self.doorbells.missed is None:
                 self.ha.changed.set()
-        elif action == 'seen' and self.doorbells.seen():
-            self.ha.changed.set()
+        elif action == 'seen':
+            # The missed ring opened again from the top bar: its door key gets its lock's state and follows it again.
+            if isinstance(key, str) and (self.doorbells.ring(key) or {}).get('door'):
+                self.doorbells.back(key, node)
+                ring = self.doorbells.ring(key)
+                if ring['door'].get('lock'):
+                    await self.doorbell_send(self.doorbell_view_screens(key), self.doorbells.door_message(key, self.doorbell_lock_state(ring['door'])))
+                    asyncio.ensure_future(self.doorbell_follow_lock(key))
+            if self.doorbells.seen():
+                self.ha.changed.set()
 
     async def doorbell_loop(self):
         """Rings and the screens' reports of them, in arrival order."""
@@ -4385,6 +4509,9 @@ def create_app(manager, development=False):
                 'build_server': manager.build_server.view(),
                 # What this app shares about plugins (plugin_likes.py): the likes' yes, counting, whether cards ask.
                 'plugin_sharing': manager.plugins.liker.view() if editor_features['plugins'] else None,
+                # The live streams of every screen together against the most the app serves (live_stream.py): the
+                # camera card says them, so whoever adds a ninth knows why it shows its stills.
+                'live_streams': manager.live.usage(),
                 'language': manager.region.view()}
     async def seen_pending(payload):
         """Marks each screen that waits for pairing that Home Assistant has found on the network (`seen`); the rest is

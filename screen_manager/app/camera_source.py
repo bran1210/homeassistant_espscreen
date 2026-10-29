@@ -20,24 +20,61 @@ the cheapest road there is (measured 2026-10-10 on an EZVIZ, 1080p main stream a
 
 One source per camera, shared by every screen that watches it; it stops a few seconds after the last one stops. What a
 screen gets of a frame is live_pictures', how it travels live_stream's.
+
+Every decoded WebRTC frame is looked at before a screen gets it (FrameWatch): one the decoder marks corrupt is left out
+and the one before stays; a gap in the frames' timestamps, a frame much brighter than the one before and the one after
+(a "flash"), the packets lost on the way, the NACKs and PLIs this app sent back and the frames live_pictures could not
+make into a JPEG the screen takes are counted, and said every FRAME_REPORT_SECONDS when any is not 0. With the file
+DUMP_MARK in Home Assistant's config folder, each flagged frame and the two before and after it are kept as JPEGs.
 """
 import asyncio
+import collections
 import logging
+import os
+from pathlib import Path
 import time
 
 import catalogue
+import live_pictures
 
 LOG = logging.getLogger(__name__)
+
+
+def webrtc_here():
+    """Whether this install can take WebRTC at all (aiortc): without it a camera's snapshots never try it again."""
+    try:
+        import aiortc  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 LINGER_SECONDS = 5        # a camera nobody watches any more stops after this (a screen that asks again at once finds it)
 SNAPSHOT_FPS = 15         # a camera without a stream is asked no more often than this
 WEBRTC_FIRST_SECONDS = 20  # a WebRTC session without a frame by then gives way to the snapshots
+WEBRTC_RETRY_SECONDS = 60  # a camera on its snapshots while watched tries WebRTC again this often
 LAG_REPORT_SECONDS = 60   # how often a camera's WebRTC pictures say how far behind the camera they are (Lag)
 STILL_SECONDS = 2          # the camera's still, again this often, until WebRTC's first frame (the screen's
                            # live_view::QUIET_MS closes a stream silent for 6 s)
 SOUND_RATE = 16000        # a full view's sound: 16-bit mono at this rate (the board's resampler makes it its bus's)
 # A camera with a stream of its own (CameraEntityFeature.STREAM, by its name in Home Assistant's source).
 STREAM_FEATURE = catalogue.bits('camera', 'STREAM')
+# The frame watch (FrameWatch): its line at most this often, only when something was counted, and its totals this often
+# whatever they are, so a quiet log still says the watch runs.
+FRAME_REPORT_SECONDS = 10
+FRAME_TOTALS_SECONDS = 300
+# A flash: the picture at least FLASH_RISE times as bright as before it (the median of its last frames) and FLASH_STEPS of
+# 255 brighter, falling back at least halfway within FLASH_FRAMES frames. One frame or a second of them: Max saw the
+# flash on every tile of the living room's camera at once (2026-10-28), and a camera's own jump of exposure lasts
+# frames, not one. A change of light that stays (a lamp, the camera's night mode) is no flash.
+FLASH_RISE, FLASH_STEPS, FLASH_FRAMES = 1.25, 8, 15
+# A gap: frames this many times the usual step between their timestamps apart.
+GAP_STEPS = 1.8
+# Evidence, on the bench: with this file in Home Assistant's config folder each flagged frame, the two before and the two
+# after it go to DUMP_DIR as JPEGs, at most DUMP_MOST files in all (the oldest go).
+HA_CONFIG = Path(os.environ.get('HA_CONFIG', '/homeassistant'))
+DUMP_MARK = HA_CONFIG / 'tessera_frame_dump'
+DUMP_DIR = HA_CONFIG / 'tessera_diagnostics' / 'frames'
+DUMP_MOST = 50
 
 
 class Frame:
@@ -77,6 +114,161 @@ class Lag:
         return sum(seen) / len(seen), max(seen), len(seen)
 
 
+def luma(frame):
+    """The mean brightness (0 to 255) of a decoded frame, from a grid of 40 x 24 of its pixels: swscale picks them in grey,
+    without RGB and without numpy (0.05 ms for 1080p)."""
+    small = frame.reformat(width=40, height=24, format='gray', interpolation='POINT')
+    plane = small.planes[0]
+    data, stride = bytes(plane), plane.line_size
+    return sum(sum(data[row * stride:row * stride + 40]) for row in range(24)) / 960
+
+
+class FrameDump:
+    """The JPEGs of a flagged moment (DUMP_DIR/<entity>/<pts>.jpg): a corrupt frame or a flash, with the two frames before
+    it and the two after it, made in a thread of their own, at most DUMP_MOST files in all. Every frame is kept as a copy
+    of THUMB_WIDTH pixels wide while the dump is on, so a flash of a second of 1080p does not hold seconds of 1080p."""
+
+    THUMB_WIDTH = 480
+
+    def __init__(self, entity, folder=None, most=DUMP_MOST):
+        self.folder = Path(folder or DUMP_DIR) / entity.replace('.', '_')
+        self.most, self.recent, self.after = most, collections.deque(maxlen=FLASH_FRAMES + 4), 0
+
+    def frame(self, frame, flagged=0):
+        """Every frame the watch keeps; `flagged` the number of frames up to this one that make the moment (1 for this
+        frame alone): those and the two before them go out now, the two after them as they come."""
+        try:
+            width = min(self.THUMB_WIDTH, frame.width)
+            thumb = frame.reformat(width=width, height=max(2, frame.height * width // frame.width // 2 * 2), format='rgb24')
+        except Exception:  # noqa: BLE001 - only evidence
+            return
+        thumb.pts = frame.pts
+        self.recent.append(thumb)
+        if flagged:
+            self.write(list(self.recent)[-(flagged + 2):])
+            self.after = 2
+        elif self.after:
+            self.after -= 1
+            self.write([thumb])
+
+    def write(self, frames):
+        def save():
+            self.folder.mkdir(parents=True, exist_ok=True)
+            for each in frames:
+                each.to_image().save(self.folder / f'{each.pts if each.pts is not None else id(each)}.jpg', 'JPEG', quality=90)
+            files = sorted(self.folder.parent.glob('*/*.jpg'), key=lambda path: path.stat().st_mtime)
+            for old in files[:max(0, len(files) - self.most)]:
+                old.unlink(missing_ok=True)
+        task = asyncio.get_running_loop().run_in_executor(None, save)
+        task.add_done_callback(lambda done: done.exception() and LOG.warning('Live frame dump failed: %s', done.exception()))
+
+
+class FrameWatch:
+    """Every decoded frame of a camera's WebRTC before a screen gets it (Max saw a white flash on a live tile now and then,
+    2026-10-28): `feed` says whether to show it. A frame the decoder marks corrupt is left out and counted; a gap in the
+    timestamps, a flash (FLASH_RISE) and the key frames are counted; `line` says it all every FRAME_REPORT_SECONDS when
+    any of it is not 0, with the transport's packets lost, NACKs, PLIs and live_pictures' JPEGs the screen would refuse."""
+
+    COUNTS = ('frames', 'corrupt', 'gaps', 'flashes', 'keys', 'lost', 'nacks', 'plis', 'refused', 'stills', 'not_turned')
+
+    def __init__(self, entity, clock=time.monotonic, brightness=luma, dump=None):
+        self.entity, self.clock, self.brightness, self.dump = entity, clock, brightness, dump
+        self.now = dict.fromkeys(self.COUNTS, 0)
+        self.total = dict.fromkeys(self.COUNTS, 0)
+        self.last_pts, self.steps = None, collections.deque(maxlen=30)
+        # The brightness of the last frames before any flash, and the flash going on: {'pts', 'base', 'peak', 'frames',
+        # 'key'} from its first bright frame.
+        self.calm, self.bright = collections.deque(maxlen=8), None
+        self.reported = self.totaled = clock()
+
+    def count(self, what, n=1):
+        self.now[what] += n
+        self.total[what] += n
+
+    def feed(self, frame):
+        """True to show `frame`; False for a corrupt one (the screen keeps the one before)."""
+        self.count('frames')
+        corrupt, key = bool(getattr(frame, 'is_corrupt', False)), bool(getattr(frame, 'key_frame', False))
+        pts = getattr(frame, 'pts', None)
+        if key:
+            self.count('keys')
+        if pts is not None and self.last_pts is not None and pts > self.last_pts:
+            step = pts - self.last_pts
+            usual = sorted(self.steps)[len(self.steps) // 2] if len(self.steps) >= 5 else None
+            if usual and step > GAP_STEPS * usual:
+                self.count('gaps', max(1, round(step / usual) - 1))
+            else:
+                self.steps.append(step)
+        if pts is not None:
+            self.last_pts = pts
+        if corrupt:
+            self.count('corrupt')
+            LOG.info('Live %s: corrupt frame left out (pts %s%s)', self.entity, pts, ', a key frame' if key else '')
+            if self.dump:
+                self.dump.frame(frame, flagged=1)
+            return False
+        try:
+            y = self.brightness(frame)
+        except Exception:  # noqa: BLE001 - only for the count: the frame is shown whatever happens here
+            return True
+        flagged = 0
+        flash = self.bright
+        if flash is None:
+            base = sorted(self.calm)[len(self.calm) // 2] if len(self.calm) >= 3 else None
+            if base is not None and y >= base * FLASH_RISE and y - base >= FLASH_STEPS:
+                self.bright = {'pts': pts, 'base': base, 'peak': y, 'frames': 1, 'key': key}
+            else:
+                self.calm.append(y)
+        else:
+            flash['frames'] += 1
+            flash['peak'] = max(flash['peak'], y)
+            if y <= flash['base'] + (flash['peak'] - flash['base']) / 2:
+                self.count('flashes')
+                flagged = flash['frames']  # its bright frames and this one it fell back on
+                LOG.warning('Live %s: a flash at pts %s%s, %d frame(s): brightness %.0f, up to %.0f, then %.0f', self.entity,
+                            flash['pts'], ', a key frame' if flash['key'] else '', flash['frames'] - 1, flash['base'],
+                            flash['peak'], y)
+                self.bright = None
+                self.calm.append(y)
+            elif flash['frames'] > FLASH_FRAMES:
+                # The light changed and stays: the new light is calm.
+                self.bright = None
+                self.calm.clear()
+                self.calm.append(y)
+        if self.dump:
+            self.dump.frame(frame, flagged=flagged)
+        return True
+
+    def due(self):
+        return self.clock() - self.reported >= FRAME_REPORT_SECONDS
+
+    def line(self, lost=0, nacks=0, plis=0, refused=0, stills=0, not_turned=0):
+        """The report since the last one once FRAME_REPORT_SECONDS went by, when anything but frames was counted (and
+        the totals every FRAME_TOTALS_SECONDS whatever they are); None otherwise. The transport's and the JPEGs' counts
+        are handed in as totals since the session began."""
+        now = self.clock()
+        for what, value in (('lost', lost), ('nacks', nacks), ('plis', plis), ('refused', refused), ('stills', stills),
+                            ('not_turned', not_turned)):
+            if value > self.total[what]:
+                self.count(what, value - self.total[what])
+        if now - self.reported < FRAME_REPORT_SECONDS:
+            return None
+        counts, self.now, self.reported = self.now, dict.fromkeys(self.COUNTS, 0), now
+        if now - self.totaled >= FRAME_TOTALS_SECONDS:
+            self.totaled = now
+            return f'Live {self.entity}: {self.words(self.total)} since the stream began'
+        if not any(counts[what] for what in self.COUNTS if what not in ('frames', 'keys')):
+            return None
+        return f'Live {self.entity}: {self.words(counts)} in {FRAME_REPORT_SECONDS} s'
+
+    @staticmethod
+    def words(c):
+        return (f"{c['frames']} frames ({c['keys']} key), {c['corrupt']} corrupt, {c['gaps']} missing, {c['flashes']} flashes; "
+                f"{c['lost']} packets lost, {c['nacks']} NACKs and {c['plis']} PLIs sent; {c['refused']} JPEGs the screen "
+                f"would refuse, {c['stills']} stills" + (f", {c['not_turned']} pictures not turned for a turned glass"
+                                                          if c['not_turned'] else ''))
+
+
 class Source:
     """The newest picture of one camera, for every screen that watches it."""
 
@@ -94,11 +286,16 @@ class Source:
         self.wants_sound = self.sound_along = False
         self.resampler = None
         self.sound_dropped = 0  # parts of sound a listener's full queue lost since the last report (Lag)
+        self.watch, self.stills = None, 0  # the frame watch of its WebRTC pictures; the stills among them
+        self.webrtc_tries = 0  # WebRTC sessions that gave no frame since it last did, while watched (run)
+        self.snapshots_since = None  # when its snapshots took over from WebRTC
 
     def mark(self, what):
         self.marks.setdefault(what, time.monotonic() - self.started)
 
     async def publish(self, jpeg=None, video=None, still=False):
+        # A still after the stream's first frame would stand between live pictures: counted (the frame watch says it).
+        self.stills += bool(still and self.watch is not None and self.watch.total['frames'])
         self.number += 1
         self.frame = Frame(self.number, jpeg, video, still)
         async with self.changed:
@@ -120,11 +317,20 @@ class Source:
 
     async def run(self):
         """Pictures while anyone watches: WebRTC for a camera with a stream, its still until the first frame and if
-        WebRTC fails; snapshots for any other camera."""
+        WebRTC fails; snapshots for any other camera. A camera whose WebRTC gave no frame sends its snapshots and tries
+        WebRTC again every WEBRTC_RETRY_SECONDS while it is watched: a camera back from its privacy mode, or a go2rtc that
+        came back, plays live again without anyone closing it."""
         try:
-            if self.streams and await self.webrtc():
+            if not self.streams or not webrtc_here():
+                await self.snapshots()
                 return
-            await self.snapshots()
+            self.webrtc_tries = 0
+            while not await self.webrtc():
+                self.webrtc_tries += 1
+                if self.webrtc_tries == 1:
+                    self.snapshots_since = time.monotonic()
+                if not await self.snapshots(until=time.monotonic() + WEBRTC_RETRY_SECONDS):
+                    return
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - a camera that fails ends its streams; screens ask again
@@ -133,15 +339,20 @@ class Source:
     def watched(self):
         return self.viewers > 0 or (self.idle_since and time.monotonic() - self.idle_since < LINGER_SECONDS)
 
-    async def snapshots(self):
-        self.route = 'snapshot'
+    async def snapshots(self, until=None, stop=None):
+        """The camera's snapshots while it is watched, or `until` that time: True when it stopped for `until`. With
+        `stop`, until that event: the snapshots of a camera that tries WebRTC again go on until its first frame."""
+        if stop is None:
+            self.route = 'snapshot'
         failures = 0
-        while self.watched():
+        while self.watched() and not (stop and stop.is_set()):
+            if until is not None and time.monotonic() >= until:
+                return True
             started = time.monotonic()
             try:
                 raw = await self.feed.fetch(self.entity)
                 failures = 0
-                if raw:
+                if raw and not (stop and stop.is_set()):
                     await self.publish(jpeg=raw)
             except asyncio.CancelledError:
                 raise
@@ -151,34 +362,54 @@ class Source:
                     LOG.info('Live %s: no snapshot (%s)', self.entity, type(error).__name__)
                 await asyncio.sleep(min(10, failures))
             await asyncio.sleep(max(0.0, 1 / SNAPSHOT_FPS - (time.monotonic() - started)))
+        return False
 
     async def webrtc(self):
         """Home Assistant's WebRTC of the camera's pictures until nobody watches; False when it gave no frame (no WebRTC
         here, no aiortc in this install, a camera go2rtc cannot relay): the snapshots take over. The camera's stills go
         first: WebRTC waits for the camera's next key frame."""
         first = asyncio.Event()
-        still = asyncio.create_task(self.stills_until(first))
+        # Until its first frame: the camera's still every STILL_SECONDS, or on a try again its snapshots as they went.
+        still = asyncio.create_task(self.snapshots(stop=first) if self.webrtc_tries else self.stills_until(first))
 
         async def take(kind, frame):
             if kind == 'audio':
                 self.heard(frame)
                 return
             self.mark('first WebRTC frame')
+            if not first.is_set() and self.webrtc_tries:
+                LOG.info('Live %s: WebRTC works again at try %d, after %.0f s of snapshots', self.entity,
+                         self.webrtc_tries + 1, time.monotonic() - self.snapshots_since)
             first.set()
-            await self.publish(video=frame)
+            if self.watch.feed(frame):
+                await self.publish(video=frame)
         try:
             self.route = 'webrtc'
+            self.watch = FrameWatch(self.entity, dump=FrameDump(self.entity) if DUMP_MARK.exists() else None)
+            live_pictures.refused.pop(self.entity, None)
+            live_pictures.not_turned.pop(self.entity, None)
+            self.stills = 0
             # The sound along in the same session when a screen with a speaker watches: the full view has it at once.
             self.sound_along = self.wants_sound
-            return await self.rtc(('video', 'audio') if self.sound_along else ('video',), take, self.watched)
+            # A session of the sound's own (hear, started by a listener while the pictures went without sound: a tile,
+            # then the full view) ends now: with both, every listener got the sound twice, shifted, and heard small
+            # snippets out of joint (a Guition 10.1 showing a reTerminal D1001 full screen, 2026-10-29).
+            if self.sound_along and self.sound is not None and not self.sound.done():
+                self.sound.cancel()
+            # A try again after the first says nothing of its failure: the log said it once, and says it works again.
+            return await self.rtc(('video', 'audio') if self.sound_along else ('video',), take, self.watched,
+                                  quiet=self.webrtc_tries > 0)
         finally:
             self.sound_along = False
             still.cancel()
+            # The sound went along with this session: listeners that stay get a session of the sound's own again.
+            if self.listeners and self.streams and (self.sound is None or self.sound.done()):
+                self.sound = asyncio.create_task(self.hear())
 
-    async def rtc(self, kinds, take, keep):
+    async def rtc(self, kinds, take, keep, quiet=False):
         """One WebRTC session of Home Assistant's for the camera's `kinds` ('video', 'audio'): `take(kind, frame)` for
         each frame while `keep()`. False when no frame of the first kind came within WEBRTC_FIRST_SECONDS or the session
-        could not start."""
+        could not start; `quiet` leaves out the log line that says so."""
         try:
             from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
             from aiortc.sdp import candidate_from_sdp
@@ -193,6 +424,22 @@ class Source:
         for each in kinds:
             connection.addTransceiver(each, direction='recvonly')
         pulls = []
+        # The pictures' session counts what its receiver asks back: NACKs (the packets it lost) and PLIs (a new key frame
+        # after a loss it could not mend; aiortc's jitter buffer asks one), through aiortc's own two senders.
+        watch = self.watch if kind == 'video' else None
+        asked = {'nacks': 0, 'plis': 0}
+        receiver = connection.getTransceivers()[0].receiver if watch else None
+        if receiver is not None:
+            send_nack, send_pli = receiver._send_rtcp_nack, receiver._send_rtcp_pli
+
+            async def nack(media_ssrc, lost):
+                asked['nacks'] += len(lost)
+                await send_nack(media_ssrc, lost)
+
+            async def pli(media_ssrc):
+                asked['plis'] += 1
+                await send_pli(media_ssrc)
+            receiver._send_rtcp_nack, receiver._send_rtcp_pli = nack, pli
 
         @connection.on('track')
         def on_track(track):
@@ -259,10 +506,14 @@ class Source:
                                        return_when=asyncio.FIRST_COMPLETED)
                     if not first.is_set():
                         why = ended(listening) or f'nothing in {WEBRTC_FIRST_SECONDS} s'
-                        LOG.info('Live %s: no WebRTC %s (%s)', self.entity, kind, why)
+                        if not quiet:
+                            LOG.info('Live %s: no WebRTC %s (%s); its snapshots meanwhile, WebRTC again every %d s',
+                                     self.entity, kind, why, WEBRTC_RETRY_SECONDS)
                         return False
                     while keep() and not listening.done() and all(not p.done() for p in pulls):
                         await asyncio.sleep(1)
+                        if watch is not None:
+                            await self.watch_report(watch, receiver, asked)
                     why = ended(listening)
                     if why:
                         LOG.info('Live %s: WebRTC %s ended (%s)', self.entity, kind, why)
@@ -271,13 +522,31 @@ class Source:
                     arrived.cancel()
                     listening.cancel()
         except (ConnectionError, OSError, asyncio.TimeoutError) as error:
-            LOG.info('Live %s: no WebRTC %s (%s)', self.entity, kind, error)
+            if not quiet:
+                LOG.info('Live %s: no WebRTC %s (%s); its snapshots meanwhile, WebRTC again every %d s', self.entity,
+                         kind, error, WEBRTC_RETRY_SECONDS)
             return False
         finally:
             for task in pulls:
                 ended(task)
                 task.cancel()
             await connection.close()
+
+    async def watch_report(self, watch, receiver, asked):
+        """The frame watch's line when one is due, with the packets the receiver lost (its inbound-rtp stats)."""
+        if not watch.due():
+            return
+        lost = 0
+        try:
+            for stats in (await receiver.getStats()).values():
+                if getattr(stats, 'type', None) == 'inbound-rtp':
+                    lost += max(0, getattr(stats, 'packetsLost', 0) or 0)
+        except Exception:  # noqa: BLE001 - the stats only for the log
+            pass
+        told = watch.line(lost=lost, nacks=asked['nacks'], plis=asked['plis'], refused=live_pictures.refused.get(self.entity, 0),
+                          stills=self.stills, not_turned=live_pictures.not_turned.get(self.entity, 0))
+        if told:
+            LOG.info('%s', told)
 
     # ---- The camera's sound, for a full view with a speaker: 16-bit mono at SOUND_RATE, in parts as it comes ----
     def listening(self):

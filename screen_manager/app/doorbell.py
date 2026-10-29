@@ -8,12 +8,17 @@ live with its sound; any other screen gets the camera's alert with its picture. 
 A screen reports how the ring ended there (esphome.screen_doorbell): the first that answers it (a touch, or its close key)
 closes it on the others; when nobody answered, the ring is missed, and the top bar of the doorbell screens shows it
 ("2 min ago") until someone opens it again there or a later ring of that camera is answered.
+
+The event may name a door: a lock entity, or an action of the automation's own (a script, a gate's button). The view then
+has a door key, which opens after a second tap and reports `door`; the app performs lock.unlock on the lock, or the action,
+as it performs an alert's button, and sends the lock's state to the screens while the ring shows.
 """
+import re
 import secrets
 import time
 
 import tile_icons
-from core import _whole
+from core import _whole, alert_action
 from i18n import t
 
 FEATURE = 'doorbell'
@@ -29,9 +34,22 @@ ENDINGS = (('answered', 'Someone touched the view: the ring is answered and clos
            ('missed', 'Nobody touched it before its timeout'),
            ('seen', 'A missed ring was opened again from the top bar'))
 ANSWERS = ('answered', 'closed')
+# A second tap on the view's door key: the app opens the ring's door (its lock, or its action). Not an ending.
+DOOR = 'door'
+# The op's `d`: what the door key is (module_doorbell.cpp, doorbell_door.h).
+DOOR_LOCK, DOOR_ACTION = 1, 2
+# How long after a ring its door may still be opened from a screen that shows it, and the app sends that lock's state:
+# the view closes five minutes after its last touch, and every touch keeps it open, so a quarter of an hour at most.
+DOOR_LIFE = 900
+# Two door reports of one ring within this many seconds are one (a screen whose report Home Assistant delivered twice).
+DOOR_AGAIN = 3
 # How long a ring nobody touches stays on the glass, in seconds; the app counts it as missed a little after, also when no
 # screen could report (one that may not send events to Home Assistant).
 TIMEOUT, TIMEOUT_MIN, TIMEOUT_MAX, MISSED_GRACE = 60, 10, 600, 5
+# How long a missed ring stays in the top bars after it rang, in minutes (`keep_minutes`): 0 or none until someone opens
+# it, as before; the wizard offers KEEP_CHOICES and writes KEEP_NEW into a new automation. The screens count it
+# themselves from the ring's moment (header_bar::Item::until), in standby too.
+KEEP_MAX, KEEP_CHOICES, KEEP_NEW = 1440, (10, 30, 60, 240, 0), 30
 # The alert of a screen without the doorbell's view: its icon.
 ALERT_ICON = 'doorbell'
 # The top bar's item of a missed ring: the doorbell's icon and how long ago it rang, which the screen counts itself.
@@ -43,7 +61,14 @@ FIELDS = (
     ('title', 'string', 'Title', 'What the screen calls the doorbell, at the top of its view and as the alert\'s title. Empty takes the camera\'s name.', 'Front door'),
     ('screen', 'string', 'Screen', 'Which screens get the ring: a device name (such as kitchen-screen), the name Home Assistant shows, or a room, which reaches every screen in it. A list reaches several. Leave it out for every screen. A name that matches no screen sends nothing.', 'kitchen-screen'),
     ('timeout', 'int', 'Timeout', f'Seconds the ring stays when nobody touches it, {TIMEOUT_MIN} to {TIMEOUT_MAX}. Empty is {TIMEOUT}. A touch keeps it open.', TIMEOUT),
+    ('keep_minutes', 'int', 'Keep missed', f'Minutes a ring nobody answered stays in the top bar of the screens with its view, counted from the ring, 1 to {KEEP_MAX}. Empty or 0: until someone opens it.', KEEP_NEW),
+    ('sound', 'bool', 'Sound', 'Whether the doorbell\'s own sound plays at once when it rings, where the screen has a speaker. Empty or true: the view opens with Sound on. false: it opens quiet (a studio, a bedroom), and a tap on Sound turns it on.', True),
+    ('chime', 'bool', 'Chime', 'Whether the screen plays its chime when it rings, where it has a speaker. Empty or true: it chimes. false: it rings without one, the view opens all the same.', True),
+    ('lock', 'string', 'Lock', 'A lock entity the view\'s door key unlocks, after a second tap; the key shows its state. A lock that asks for a code needs a default code in Home Assistant (the lock\'s settings). Leave it out for no door key.', 'lock.front_door'),
+    ('door_action', 'string', 'Door action', 'Instead of a lock: a Home Assistant action the door key performs after a second tap, such as script.open_gate or button.press. `door_data` gives its fields (entity_id, ...).', 'script.open_gate'),
+    ('door_data', 'object', 'Door data', 'The fields of `door_action`, such as entity_id.', {'entity_id': 'button.gate_open'}),
 )
+LOCK_ENTITY = re.compile(r'lock\.[a-z0-9_]+')
 
 
 def request(data):
@@ -70,6 +95,57 @@ def request(data):
         else:
             timeout = max(TIMEOUT_MIN, min(TIMEOUT_MAX, whole))
     return camera, title, timeout, unusable
+
+
+def keep_of(data):
+    """(minutes, unusable): how long a missed ring of the event stays in the top bars (`keep_minutes`), 0 for until
+    someone opens it, at most KEEP_MAX."""
+    value = (data if isinstance(data, dict) else {}).get('keep_minutes')
+    if value in (None, ''):
+        return 0, []
+    whole = _whole(value)
+    if whole is None or whole < 0:
+        return 0, ['keep_minutes']
+    return min(KEEP_MAX, whole), []
+
+
+def sound_of(data, field='sound'):
+    """(on, unusable): whether the view opens with its sound on (`field` sound), or chimes (`chime`): True unless the
+    event's field says false."""
+    value = (data if isinstance(data, dict) else {}).get(field)
+    if value is None or value == '':
+        return True, []
+    if isinstance(value, bool):
+        return value, []
+    if isinstance(value, str) and value.strip().lower() in ('true', 'on', 'yes', 'false', 'off', 'no'):
+        return value.strip().lower() in ('true', 'on', 'yes'), []
+    return True, [field]
+
+
+def door_of(data):
+    """(door, unusable): the event's door, {'lock': entity} or {'action': action, 'data': fields}, None without one. A lock
+    goes before an action when the event names both."""
+    data = data if isinstance(data, dict) else {}
+    lock = data.get('lock')
+    if lock not in (None, ''):
+        if isinstance(lock, str) and LOCK_ENTITY.fullmatch(lock.strip()) and len(lock) <= 120:
+            return {'lock': lock.strip()}, []
+        return None, ['lock']
+    action, usable = alert_action(data, 'door_action', 'door_data')
+    if not usable:
+        return None, ['door_action']
+    return ({'action': action[0], 'data': action[1]} if action else None), []
+
+
+def door_blocked(lock, states, entry):
+    """Why the door key cannot unlock `lock`, None when it can: a lock that asks for a code (its code_format) without a
+    default code in its registry options (core.lock_extras); the view has no keypad, nothing may lie over its picture."""
+    attributes = ((states.get(lock) or {}).get('attributes') or {})
+    options = (entry or {}).get('options') if isinstance(entry, dict) else None
+    saved = isinstance(options, dict) and isinstance(options.get('lock'), dict) and bool(options['lock'].get('default_code'))
+    if attributes.get('code_format') and not saved:
+        return 'asks for a code and has no default code'
+    return None
 
 
 def name_of(camera, device_name, states):
@@ -131,8 +207,10 @@ def reference():
     return {'show': SHOW, 'dismiss': DISMISS, 'event': EVENT, 'feature': FEATURE, 'answered': ANSWERED, 'missed': MISSED,
             'trigger_domains': TRIGGER_DOMAINS,
             'timeout': {'default': TIMEOUT, 'min': TIMEOUT_MIN, 'max': TIMEOUT_MAX},
+            'keep': {'choices': list(KEEP_CHOICES), 'new': KEEP_NEW, 'max': KEEP_MAX},
             'fields': [{'name': name, 'type': kind, 'label': t(f'addon.doorbell.fields.{name}.label'),
-                        'help': t(f'addon.doorbell.fields.{name}.help', min=TIMEOUT_MIN, max=TIMEOUT_MAX, default=TIMEOUT),
+                        'help': t(f'addon.doorbell.fields.{name}.help', min=TIMEOUT_MIN, max=TIMEOUT_MAX, default=TIMEOUT,
+                                  most=KEEP_MAX),
                         'example': value} for name, kind, _, _, value in FIELDS],
             'endings': [{'action': action, 'label': t(f'addon.doorbell.endings.{action}')} for action, _ in ENDINGS]}
 
@@ -142,24 +220,80 @@ class Doorbells:
 
     def __init__(self):
         # key -> {'camera', 'name', 'at', 'timeout', 'screens': inboxes with the view, 'alerts': nodes with the alert,
-        # 'answered', 'since'}
+        # 'answered', 'since', 'door': door_of's door or None, 'nodes': the nodes with the view, 'gone': those whose view
+        # closed, 'door_at': the last door report}
         self.rings = {}
-        self.missed = None   # {'key', 'camera', 'name', 'at'} or None
+        self.missed = None   # {'key', 'camera', 'name', 'at', 'keep'} or None
 
-    def start(self, camera, name, timeout, screens, alerts=()):
+    def start(self, camera, name, timeout, screens, alerts=(), door=None, nodes=(), sound=True, chime=True, keep=0):
         key = secrets.token_hex(4)
         self.rings[key] = {'camera': camera, 'name': name, 'at': int(time.time()), 'timeout': timeout, 'screens': list(screens),
-                           'alerts': list(alerts), 'answered': False, 'since': time.monotonic()}
+                           'alerts': list(alerts), 'answered': False, 'since': time.monotonic(), 'door': door,
+                           'nodes': list(nodes), 'gone': set(), 'door_at': None, 'sound': sound, 'chime': chime,
+                           'keep': keep}
         # Rings older than their longest life are history.
-        for old in [k for k, ring in self.rings.items() if time.monotonic() - ring['since'] > TIMEOUT_MAX * 2]:
+        for old in [k for k, ring in self.rings.items() if time.monotonic() - ring['since'] > max(TIMEOUT_MAX * 2, DOOR_LIFE)]:
             del self.rings[old]
         return key
 
-    def message(self, key, close=False):
+    def message(self, key, close=False, door_state=None, link=None):
+        """The op of ring `key`, or its close. A ring with a door says what its key is (`d`), and a lock its state (`ds`);
+        one that opens quiet says so (`m`), one without its chime too (`nc`); `link`, the stream the app made for that
+        screen as the event came (`l`), which its view opens at once instead of asking for one."""
         ring = self.rings.get(key)
         if close or ring is None:
             return {'v': 1, 'op': 'doorbell', 'k': key, 'c': 1}
-        return {'v': 1, 'op': 'doorbell', 'e': ring['camera'], 'n': ring['name'], 'k': key, 'r': ring['at'], 't': ring['timeout']}
+        message = {'v': 1, 'op': 'doorbell', 'e': ring['camera'], 'n': ring['name'], 'k': key, 'r': ring['at'], 't': ring['timeout']}
+        if ring.get('sound') is False:
+            message['m'] = 1
+        if ring.get('chime') is False:
+            message['nc'] = 1
+        if link:
+            message['l'] = link
+        door = ring.get('door')
+        if door and door.get('lock'):
+            message.update(d=DOOR_LOCK, ds=str(door_state or '')[:16])
+        elif door:
+            message['d'] = DOOR_ACTION
+        return message
+
+    @staticmethod
+    def door_message(key, state):
+        """A lock's new state for the door key of ring `key`, while its view shows."""
+        return {'v': 1, 'op': 'doorbell', 'k': key, 'ds': str(state or '')[:16]}
+
+    def gone(self, key, nodes):
+        """The view of ring `key` closed on `nodes` (their report, or the app closed it there)."""
+        ring = self.rings.get(key)
+        if ring is not None:
+            ring['gone'].update(nodes)
+
+    def back(self, key, node):
+        """A screen opened ring `key` again (the missed ring from its top bar)."""
+        ring = self.rings.get(key)
+        if ring is not None:
+            ring['gone'].discard(node)
+            ring['since_seen'] = time.monotonic()
+
+    def showing(self, key):
+        """The nodes whose view of ring `key` may still show, within the door's life."""
+        ring = self.rings.get(key)
+        if ring is None or time.monotonic() - ring.get('since_seen', ring['since']) > DOOR_LIFE:
+            return []
+        return [node for node in ring['nodes'] if node not in ring['gone']]
+
+    def door_press(self, key, node):
+        """A screen's door report: the door to open (the ring's lock or action), or None when it may not: no such ring or
+        no door, a screen that did not show it or whose view closed, past the door's life, or a repeat within
+        DOOR_AGAIN seconds."""
+        ring = self.rings.get(key)
+        if ring is None or not ring.get('door') or node not in self.showing(key):
+            return None
+        now = time.monotonic()
+        if ring['door_at'] is not None and now - ring['door_at'] < DOOR_AGAIN:
+            return None
+        ring['door_at'] = now
+        return ring['door']
 
     def ring(self, key):
         return self.rings.get(key)
@@ -184,7 +318,8 @@ class Doorbells:
         ring = self.rings.get(key)
         if ring is None or ring['answered']:
             return False
-        self.missed = {'key': key, 'camera': ring['camera'], 'name': ring['name'], 'at': ring['at']}
+        self.missed = {'key': key, 'camera': ring['camera'], 'name': ring['name'], 'at': ring['at'],
+                       'keep': ring.get('keep', 0)}
         return True
 
     def seen(self):
@@ -193,11 +328,20 @@ class Doorbells:
         self.missed = None
         return was
 
-    def bar_item(self):
-        """The top bar's item of the missed ring, for a screen whose hello says `doorbell`; None without one."""
+    def bar_item(self, now=None):
+        """The top bar's item of the missed ring, for a screen whose hello says `doorbell`; None without one. A ring kept
+        for a while says until when (`x`), and the screens take it away then by their own clock; past it, it is gone here
+        too."""
         if not self.missed:
             return None
-        return {'k': 'ago', 'i': ICON, 'e': self.missed['at'], 'b': 1}
+        until = self.missed['at'] + 60 * self.missed['keep'] if self.missed.get('keep') else 0
+        if until and (time.time() if now is None else now) >= until:
+            self.missed = None
+            return None
+        item = {'k': 'ago', 'i': ICON, 'e': self.missed['at'], 'b': 1}
+        if until:
+            item['x'] = until
+        return item
 
 
 def with_missed(items, item, limit):

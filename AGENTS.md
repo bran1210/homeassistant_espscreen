@@ -15,8 +15,15 @@ Home Assistant entity belongs in a board file. docs/README.md lists every doc an
 
 ## Where to start for a change
 
+Read in this order, and stop as soon as you know enough: docs/ARCHITECTURE.md (the one map of the firmware's layers,
+the hard rules between them and the measurement behind each), then the document of the thing you change (the table
+below), then the head of the file (every file in `components/smart_display/` opens with what it is, what it knows and
+what it does not, and which test proves it), then that test. A change in the code gets its line in the document of its
+subject in the same commit, and a measurement goes with it; the map is updated when a layer, a seam or a rule changes.
+
 | You want to | Read first | The source of truth |
 |---|---|---|
+| understand how the firmware's layers fit, or find where a rule is written | docs/ARCHITECTURE.md | `engine_build.py`, `glass.h`, `picture_engine.h`, `live_view.h`, `hw.h`, `pressure.h`, `audio_owner.h` |
 | support a new entity type, or a new control on a tile | docs/CATALOGUE.md | `catalogue/<type>.yaml`, `catalogue/_ha.json` |
 | add a screen setting | docs/SETTINGS.md | `settings_screen.h`, `SETTING_RULES` in `screen_manager/app/core.py` |
 | give a board a setting of its own (Extras: on the screen, in the app, in Home Assistant) | docs/SETTINGS.md, "A board's own settings" | `boards.yaml` `settings`, the board's `BOOT_BOARD_SETTINGS`, `entity_settings.py` |
@@ -126,7 +133,8 @@ release is checked fully, once a week. docs/TESTING.md says what each layer prov
   under `web/src`, `cd web && npm run build` (the app serves that build) and commit `screen_manager/app/static` with it.
 - **At a release** (and a hotfix) everything runs, on the commit that goes out: `tools/check.sh`, CI on that commit
   (`tools/release.py ci`: every board on both ESPHome versions), the renders when the release changes what screens
-  draw, and the upgrade test on the bench (docs/TESTING.md, "6. The upgrade"). What fails there is fixed in the release.
+  draw, and the upgrade test on the home Home Assistant (docs/TESTING.md, "6. The upgrade"; the deploy-home skill's
+  `release-test`). What fails there is fixed in the release.
 - `tools/check.sh`: Python and C++ tests, package and generator checks, translations, the editor's tests, lint, types
   and build, the WASM preview tests and the layout audit of every card on every board shape.
 - Its firmware builds: `tools/check.sh --firmware --affected` builds the boards a change reaches; a change that reaches
