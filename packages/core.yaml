@@ -2748,7 +2748,7 @@ script:
 # (components/smart_display).
 smart_display:
   language: ${LANGUAGE}
-  camera_orientation: ${CAMERA_ORIENTATION}
+#  camera_orientation: ${CAMERA_ORIENTATION}
 
 # HA blueprint transport; never publishes the JSON command as an HA state.
 text:
